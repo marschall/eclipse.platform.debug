@@ -12,6 +12,7 @@ package org.eclipse.ui.internal.console;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Iterator;
 import java.util.List;
 
@@ -44,6 +45,12 @@ import org.eclipse.ui.progress.WorkbenchJob;
  *
  */
 public class IOConsolePartitioner implements IConsoleDocumentPartitioner, IDocumentPartitionerExtension {
+
+	private static final char NEW_LINE = '\n';
+	private static final char BACK_SPACE = '\b';
+	private static final char CARRIAGE_RETURN = '\r';
+	private static final char FORM_FEED = '\f';
+
 	private PendingPartition consoleClosedPartition;
 	private IDocument document;
 	private ArrayList<IOConsolePartition> partitions;
@@ -54,7 +61,7 @@ public class IOConsolePartitioner implements IConsoleDocumentPartitioner, IDocum
 	/**
 	 * A list of PendingPartitions to be appended by the updateJob
 	 */
-	private ArrayList<PendingPartition> updatePartitions;
+	private List<PendingPartition> updatePartitions;
 	/**
 	 * The last partition appended to the document
 	 */
@@ -549,42 +556,39 @@ public class IOConsolePartitioner implements IConsoleDocumentPartitioner, IDocum
 
 	void processQueue() {
     	synchronized (overflowLock) {
-			ArrayList<PendingPartition> pendingCopy = new ArrayList<PendingPartition>();
-    		StringBuffer buffer = null;
+			ArrayList<PendingPartition> pendingCopy;
     		boolean consoleClosed = false;
 			synchronized(pendingPartitions) {
+				pendingCopy = new ArrayList<PendingPartition>(pendingPartitions.size());
 				pendingCopy.addAll(pendingPartitions);
 				pendingPartitions.clear();
 				fBuffer = 0;
 				pendingPartitions.notifyAll();
 			}
-			// determine buffer size
-			int size = 0;
-			for (PendingPartition pp : pendingCopy) {
-				if (pp != consoleClosedPartition) {
-					size+= pp.text.length();
-				}
-			}
-			buffer = new StringBuffer(size);
-			for (PendingPartition pp : pendingCopy) {
-				if (pp != consoleClosedPartition) {
-					buffer.append(pp.text);
-				} else {
-					consoleClosed = true;
-				}
-			}
     		if (connected) {
     			setUpdateInProgress(true);
-    			updatePartitions = pendingCopy;
-    			firstOffset = document.getLength();
-    			try {
-    				if (buffer != null) {
-    					document.replace(firstOffset, 0, buffer.toString());
+				for (PendingPartition pp : pendingCopy) {
+					updatePartitions = Collections.singletonList(pp);
+					firstOffset = document.getLength();
+					if (pp != consoleClosedPartition) {
+						try {
+							replace(document, firstOffset, 0, pp.text);
+						} catch (BadLocationException e) {
+						}
+					} else {
+						consoleClosed = true;
     				}
-    			} catch (BadLocationException e) {
     			}
     			updatePartitions = null;
     			setUpdateInProgress(false);
+			} else {
+				for (PendingPartition pp : pendingCopy) {
+					if (pp == consoleClosedPartition) {
+						consoleClosed = true;
+						break;
+					}
+				}
+
     		}
     		if (consoleClosed) {
     			console.partitionerFinished();
@@ -592,6 +596,147 @@ public class IOConsolePartitioner implements IConsoleDocumentPartitioner, IDocum
     		checkBufferSize();
     	}
 
+	}
+
+	private static void replace(IDocument document, int pos, int length, CharSequence text) throws BadLocationException {
+		if (containsControlCharacter(text)) {
+			int lineNumber = document.getLineOfOffset(pos);
+			boolean endsWithNewLIne = document.getLineDelimiter(lineNumber) != null;
+			int actualPosition;
+			StringBuilder buffer;
+			int lengthDelta;
+			if (endsWithNewLIne) {
+				// pos is the start of a new line
+				// assume form feeds are rare and therefore don't add additional
+				// capacity
+				buffer = new StringBuilder(length);
+				actualPosition = pos;
+				lengthDelta = 0;
+			} else {
+				// there already exists a line which we may have to modify
+				IRegion lineInformation = document.getLineInformation(lineNumber);
+				actualPosition = lineInformation.getOffset();
+				// assume form feeds are rare and therefore don't add additional
+				// capacity
+				int lineLength = lineInformation.getLength();
+				buffer = new StringBuilder(length + lineLength);
+				String line = document.get(lineInformation.getOffset(), lineLength);
+				buffer.append(line);
+				lengthDelta = lineLength;
+			}
+
+			int offset = 0;
+			int lineStart = 0; // start of the current line in the output buffer
+			DelimiterInfo delimiterInfo = nextDelimiterInfo(text, offset);
+			while (delimiterInfo != null) {
+				processLine(text, offset, lineStart, delimiterInfo.delimiterIndex - offset, buffer);
+				buffer.append(text, delimiterInfo.delimiterIndex, delimiterInfo.delimiterIndex + delimiterInfo.delimiterLength);
+
+				offset = delimiterInfo.delimiterIndex + delimiterInfo.delimiterLength;
+				delimiterInfo = nextDelimiterInfo(text, offset);
+				lineStart = buffer.length();
+
+			}
+			processLine(text, offset, lineStart, text.length() - offset, buffer);
+
+			String processedText = buffer.toString();
+			document.replace(actualPosition, length + lengthDelta, processedText);
+		} else {
+			document.replace(pos, length, text.toString());
+		}
+	}
+
+	private static boolean containsControlCharacter(CharSequence text) {
+		int length = text.length();
+		int i = 0;
+		while (i < length) {
+			char ch = text.charAt(i);
+			if (ch == BACK_SPACE || ch == FORM_FEED) {
+				return true;
+			}
+			if (ch == CARRIAGE_RETURN) {
+				if (i + 1 < length && text.charAt(i + 1) == NEW_LINE) {
+					// don't treat CR LF on Windows as control character
+					// skip the character after the current one since we already
+					// know it's a newline
+					i += 2;
+					continue;
+				}
+				return true;
+			}
+			i += 1;
+		}
+		return false;
+	}
+
+	private static void processLine(CharSequence text, int start, int initialLineStart, int length, StringBuilder buffer) {
+		if (length == 0) {
+			return;
+		}
+
+		// position where the next character insert should happen
+		int insertIndex = buffer.length();
+		// start index of the current line in the output buffer
+		int lineStart = initialLineStart;
+		// end index of the line in text
+		int end = start + length;
+		for (int i = start; i < end; i++) {
+			char ch = text.charAt(i);
+			if (ch == BACK_SPACE) {
+				if (insertIndex > lineStart) {
+					// can backtrack only in current line
+					insertIndex -= 1;
+				}
+			} else if (ch == CARRIAGE_RETURN) {
+				insertIndex = lineStart;
+			} else if (ch == FORM_FEED) {
+				int headPosition = insertIndex - lineStart;
+				buffer.append('\n');
+				lineStart = buffer.length();
+				for (int j = 0; j < headPosition; j++) {
+					buffer.append(' ');
+				}
+				insertIndex = lineStart + headPosition;
+			} else {
+				// other character insert at insertIndex
+				if (insertIndex == buffer.length()) {
+					buffer.append(ch);
+				} else {
+					// #charAt does not work when index == length
+					buffer.setCharAt(insertIndex, ch);
+				}
+				insertIndex += 1;
+			}
+		}
+	}
+
+	private static DelimiterInfo nextDelimiterInfo(CharSequence text, int offset) {
+		int length = text.length();
+		for (int i = offset; i < length; i++) {
+			char ch = text.charAt(i);
+			if (ch == '\r') {
+				// \r\n -> will be treated as a new line
+				// \r something else -> will be treated as \r
+				if (i + 1 < length) {
+					if (text.charAt(i + 1) == '\n') {
+						return new DelimiterInfo(i, 2);
+					}
+				}
+			} else if (ch == '\n') {
+				return new DelimiterInfo(i, 1);
+			}
+		}
+		return null;
+	}
+
+	static final class DelimiterInfo {
+		int delimiterIndex;
+		int delimiterLength;
+
+		DelimiterInfo(int delimiterIndex, int delimiterLength) {
+			this.delimiterIndex = delimiterIndex;
+			this.delimiterLength = delimiterLength;
+		}
 	}
 
     /**
